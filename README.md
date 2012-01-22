@@ -145,6 +145,17 @@ Options
 - `size`: maximum pool size
 - `max_overflow`: maximum number of workers created if pool is empty
 
+Metrics
+-------
+
+You can enable the collection of metrics by specifying a
+`metrics_module` key in an application config entry for `poolboy`. The
+value should be the name of a module that provides a `notify/3`
+function conforming to the API provided by the `folsom_metrics` module
+(see [folsom][]).
+
+[folsom]: https://github.com/boundary/folsom
+
 Authors
 -------
 - Devin Torres (devinus) <devin@devintorres.com>

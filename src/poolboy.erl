@@ -56,7 +56,9 @@ ready({checkin, Pid}, State) ->
         {value, {_, Ref}, Left} -> erlang:demonitor(Ref), Left;
         false -> State#state.monitors
     end,
-    {next_state, ready, State#state{workers=Workers, monitors=Monitors}};
+    NewState = State#state{workers=Workers, monitors=Monitors},
+    send_metrics(NewState),
+    {next_state, ready, NewState};
 ready(_Event, State) ->
     {next_state, ready, State}.
 
@@ -92,14 +94,18 @@ overflow({checkin, Pid}, #state{overflow=1}=State) ->
         {value, {_, Ref}, Left} -> erlang:demonitor(Ref), Left;
         false -> []
     end,
-    {next_state, ready, State#state{overflow=0, monitors=Monitors}};
+    NewState = State#state{overflow=0, monitors=Monitors},
+    send_metrics(NewState),
+    {next_state, ready, NewState};
 overflow({checkin, Pid}, #state{overflow=Overflow}=State) ->
     dismiss_worker(Pid),
     Monitors = case lists:keytake(Pid, 1, State#state.monitors) of
         {value, {_, Ref}, Left} -> erlang:demonitor(Ref), Left;
         false -> State#state.monitors
     end,
-    {next_state, overflow, State#state{overflow=Overflow-1, monitors=Monitors}};
+    NewState = State#state{overflow=Overflow-1, monitors=Monitors},
+    send_metrics(NewState),
+    {next_state, overflow, NewState};
 overflow(_Event, State) ->
     {next_state, overflow, State}.
 
@@ -128,23 +134,26 @@ full({checkin, Pid}, #state{waiting=Waiting, max_overflow=MaxOverflow,
         {value, {_, Ref0}, Left0} -> erlang:demonitor(Ref0), Left0;
         false -> State#state.monitors
     end,
-    case queue:out(Waiting) of
-        {{value, {FromPid, _}=From}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
-            Monitors1 = [{Pid, Ref} | Monitors],
-            gen_fsm:reply(From, Pid),
-            {next_state, full, State#state{waiting=Left,
-                                           monitors=Monitors1}};
-        {empty, Empty} when MaxOverflow < 1 ->
-            Workers = queue:in(Pid, State#state.workers),
-            {next_state, ready, State#state{workers=Workers, waiting=Empty,
-                                            monitors=Monitors}};
-        {empty, Empty} ->
-            dismiss_worker(Pid),
-            {next_state, overflow, State#state{waiting=Empty,
-                                               monitors=Monitors,
-                                               overflow=Overflow-1}}
-    end;
+    {next_state, StateName, NewState} =
+        case queue:out(Waiting) of
+            {{value, {FromPid, _}=From}, Left} ->
+                Ref = erlang:monitor(process, FromPid),
+                Monitors1 = [{Pid, Ref} | Monitors],
+                gen_fsm:reply(From, Pid),
+                {next_state, full, State#state{waiting=Left,
+                                               monitors=Monitors1}};
+            {empty, Empty} when MaxOverflow < 1 ->
+                Workers = queue:in(Pid, State#state.workers),
+                {next_state, ready, State#state{workers=Workers, waiting=Empty,
+                                                monitors=Monitors}};
+            {empty, Empty} ->
+                dismiss_worker(Pid),
+                {next_state, overflow, State#state{waiting=Empty,
+                                                   monitors=Monitors,
+                                                   overflow=Overflow-1}}
+        end,
+    send_metrics(NewState),
+    {next_state, StateName, NewState};
 full(_Event, State) ->
     {next_state, full, State}.
 
@@ -175,8 +184,14 @@ handle_sync_event(stop, _From, _StateName, #state{worker_sup=Sup}=State) ->
 handle_sync_event(_Event, _From, StateName, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, StateName, State}.
-
 handle_info({'DOWN', Ref, _, _, _}, StateName, State) ->
+    send_metric(<<"poolboy.DOWN_rate">>, 1, meter),
+    %% why isn't this lists:keytake? We're going to kill the Pid, but
+    %% leave garbage in State#state.monitors?  Also, we link *and*
+    %% monitor the Pids, why? When we clean dismiss a Pid, we unlink
+    %% and then stop it, but shouldn't we also demonitor as part of
+    %% the dismissal so that we don't have to process an extra DOWN
+    %% message?
     case lists:keyfind(Ref, 2, State#state.monitors) of
         {Pid, Ref} ->
             exit(Pid, kill),
@@ -189,52 +204,56 @@ handle_info({'EXIT', Pid, _}, StateName, #state{worker_sup=Sup,
                                                 waiting=Waiting,
                                                 max_overflow=MaxOverflow
                                                 }=State) ->
+    send_metric(<<"poolboy.EXIT_rate">>, 1, meter),
     Monitors = case lists:keytake(Pid, 1, State#state.monitors) of
         {value, {_, Ref}, Left} -> erlang:demonitor(Ref), Left;
         false -> []
     end,
-    case StateName of
-        ready ->
-            W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-            {next_state, ready, State#state{workers=queue:in(new_worker(Sup), W),
-                                            monitors=Monitors}};
-        overflow when Overflow =< 1 ->
-            {next_state, ready, State#state{monitors=Monitors, overflow=0}};
-        overflow ->
-            {next_state, overflow, State#state{monitors=Monitors,
-                                               overflow=Overflow-1}};
-        full when MaxOverflow < 1 ->
-            case queue:out(Waiting) of
-              {{value, {FromPid, _}=From}, LeftWaiting} ->
-                  MonitorRef = erlang:monitor(process, FromPid),
-                  Monitors2 = [{FromPid, MonitorRef} | Monitors],
-                  gen_fsm:reply(From, new_worker(Sup)),
-                  {next_state, full, State#state{waiting=LeftWaiting,
-                                                 monitors=Monitors2}};
-              {empty, Empty} ->
-                  Workers2 = queue:in(new_worker(Sup), State#state.workers),
-                  {next_state, ready, State#state{monitors=Monitors,
-                                                  waiting=Empty,
-                                                  workers=Workers2}}
-          end;
-        full when Overflow =< MaxOverflow ->
-            case queue:out(Waiting) of
-              {{value, {FromPid, _}=From}, LeftWaiting} ->
-                  MonitorRef = erlang:monitor(process, FromPid),
-                  Monitors2 = [{FromPid, MonitorRef} | Monitors],
-                  NewWorker = new_worker(Sup),
-                  gen_fsm:reply(From, NewWorker),
-                  {next_state, full, State#state{waiting=LeftWaiting,
-                                                 monitors=Monitors2}};
-              {empty, Empty} ->
-                  {next_state, overflow, State#state{monitors=Monitors,
-                                                     overflow=Overflow-1,
-                                                     waiting=Empty}}
-          end;
-        full ->
-            {next_state, full, State#state{monitors=Monitors,
-                                           overflow=Overflow-1}}
-    end;
+    {next_state, NewName, NewState} =
+        case StateName of
+            ready ->
+                W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
+                {next_state, ready, State#state{workers=queue:in(new_worker(Sup), W),
+                                                monitors=Monitors}};
+            overflow when Overflow =< 1 ->
+                {next_state, ready, State#state{monitors=Monitors, overflow=0}};
+            overflow ->
+                {next_state, overflow, State#state{monitors=Monitors,
+                                                   overflow=Overflow-1}};
+            full when MaxOverflow < 1 ->
+                case queue:out(Waiting) of
+                    {{value, {FromPid, _}=From}, LeftWaiting} ->
+                        MonitorRef = erlang:monitor(process, FromPid),
+                        Monitors2 = [{FromPid, MonitorRef} | Monitors],
+                        gen_fsm:reply(From, new_worker(Sup)),
+                        {next_state, full, State#state{waiting=LeftWaiting,
+                                                       monitors=Monitors2}};
+                    {empty, Empty} ->
+                        Workers2 = queue:in(new_worker(Sup), State#state.workers),
+                        {next_state, ready, State#state{monitors=Monitors,
+                                                        waiting=Empty,
+                                                        workers=Workers2}}
+                end;
+            full when Overflow =< MaxOverflow ->
+                case queue:out(Waiting) of
+                    {{value, {FromPid, _}=From}, LeftWaiting} ->
+                        MonitorRef = erlang:monitor(process, FromPid),
+                        Monitors2 = [{FromPid, MonitorRef} | Monitors],
+                        NewWorker = new_worker(Sup),
+                        gen_fsm:reply(From, NewWorker),
+                        {next_state, full, State#state{waiting=LeftWaiting,
+                                                       monitors=Monitors2}};
+                    {empty, Empty} ->
+                        {next_state, overflow, State#state{monitors=Monitors,
+                                                           overflow=Overflow-1,
+                                                           waiting=Empty}}
+                end;
+            full ->
+                {next_state, full, State#state{monitors=Monitors,
+                                               overflow=Overflow-1}}
+        end,
+    send_metrics(NewState),
+    {next_state, NewName, NewState};
 handle_info(_Info, StateName, State) ->
     {next_state, StateName, State}.
 
@@ -266,3 +285,23 @@ prepopulate(0, _Sup, Workers) ->
     Workers;
 prepopulate(N, Sup, Workers) ->
     prepopulate(N-1, Sup, queue:in(new_worker(Sup), Workers)).
+
+-spec send_metrics(#state{}) -> ok.
+%% Send metrics, if configured in app config, based on data in state
+%% record.  Currently, the available worker count, queued (waiting)
+%% clients count, and number of monitors are recorded as histograms.
+send_metrics(#state{workers = Workers, monitors = Monitors, waiting = Waiters}) ->
+    send_metric(<<"poolboy.avail_workers">>, queue:len(Workers), histogram),
+    send_metric(<<"poolboy.waiting_clients">>, queue:len(Waiters), histogram),
+    send_metric(<<"poolboy.monitors">>, length(Monitors), histogram),
+    ok.
+
+-spec send_metric(binary(), term(), atom()) -> ok.
+%% Send a metric using the metrics module from application config or
+%% do nothing.
+send_metric(Name, Value, Type) ->
+    case application:get_env(poolboy, metrics_module) of
+        undefined -> ok;
+        {ok, Mod} -> Mod:notify(Name, Value, Type)
+    end,
+    ok.
